@@ -4,6 +4,8 @@ mod tests {
 
     use crate::error::AgentError;
     use crate::executor::{ToolExecutor, ToolSpec};
+    use crate::llm::{ChatMessage, LlmConfig, LlmProvider, Role};
+    use crate::react::{parse_react_response, PlanAndExecuteAgent, ReActAgent};
     use crate::types::{AgentConfig, Goal, Observation, Plan, Step};
     use crate::engine::Agent;
     use crate::reasoner::Action;
@@ -163,5 +165,245 @@ mod tests {
         let obs = entry.observation.as_ref().expect("should have observation");
         assert!(!obs.success);
         assert!(obs.error_message.is_some());
+    }
+
+    // ===================================================================
+    // LLM types tests
+    // ===================================================================
+
+    #[test]
+    fn test_chat_message_construction() {
+        let sys = ChatMessage::system("You are helpful");
+        assert_eq!(sys.role, Role::System);
+        assert_eq!(sys.content, "You are helpful");
+        assert!(sys.name.is_none());
+
+        let user = ChatMessage::user("Hello");
+        assert_eq!(user.role, Role::User);
+
+        let asst = ChatMessage::assistant("Hi there");
+        assert_eq!(asst.role, Role::Assistant);
+
+        let tool = ChatMessage::tool("result", "my_tool");
+        assert_eq!(tool.role, Role::Tool);
+        assert_eq!(tool.name.as_deref(), Some("my_tool"));
+    }
+
+    #[test]
+    fn test_llm_config_defaults() {
+        let config = LlmConfig::default();
+        assert_eq!(config.model, "gpt-4");
+        assert!((config.temperature - 0.7).abs() < f32::EPSILON);
+        assert!(config.max_tokens.is_none());
+        assert!(config.stop_sequences.is_empty());
+        assert!(!config.json_mode);
+    }
+
+    // ===================================================================
+    // ReAct JSON parsing tests
+    // ===================================================================
+
+    #[test]
+    fn test_react_parse_tool_call() {
+        let response = r#"{"thought": "I need to search", "action": "search", "action_input": {"query": "rust"}}"#;
+        let result = parse_react_response(response);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_react_parse_finish() {
+        let response = r#"{"thought": "I have the answer", "action": "finish", "result": "42"}"#;
+        let result = parse_react_response(response);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_react_parse_markdown_code_block() {
+        let response = "```json\n{\"thought\": \"thinking\", \"action\": \"finish\", \"result\": \"done\"}\n```";
+        let result = parse_react_response(response);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_react_parse_invalid_json() {
+        let response = "this is not json";
+        let result = parse_react_response(response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_react_parse_missing_action() {
+        let response = r#"{"thought": "hmm"}"#;
+        let result = parse_react_response(response);
+        assert!(result.is_err());
+    }
+
+    // ===================================================================
+    // MockLlmProvider
+    // ===================================================================
+
+    /// A mock LLM provider that returns canned responses.
+    struct MockLlmProvider {
+        responses: Vec<String>,
+        name: String,
+    }
+
+    impl MockLlmProvider {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                responses,
+                name: "mock".to_string(),
+            }
+        }
+    }
+
+    impl LlmProvider for MockLlmProvider {
+        fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _config: &LlmConfig,
+        ) -> Result<String, AgentError> {
+            // Count user messages to determine which response to return.
+            // The first user message is the goal, subsequent ones are observations.
+            let user_count = messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .count();
+
+            // Index: first call = 0, second call = 1, etc.
+            let idx = user_count.saturating_sub(1);
+            if idx < self.responses.len() {
+                Ok(self.responses[idx].clone())
+            } else {
+                // Default: finish.
+                Ok(r#"{"thought": "done", "action": "finish", "result": "fallback"}"#.to_string())
+            }
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    // ===================================================================
+    // ReAct loop tests with mocks
+    // ===================================================================
+
+    #[test]
+    fn test_react_loop_immediate_finish() {
+        let mock_llm = MockLlmProvider::new(vec![
+            r#"{"thought": "I know the answer", "action": "finish", "result": "42"}"#.to_string(),
+        ]);
+
+        let config = AgentConfig {
+            max_steps: 5,
+            ..Default::default()
+        };
+
+        let agent = ReActAgent::new(
+            Box::new(mock_llm),
+            Box::new(EchoExecutor),
+            config,
+        );
+
+        let trace = agent.run("What is 6*7?").expect("should succeed");
+        assert!(trace.success);
+        assert_eq!(trace.total_steps, 1);
+        assert!(trace.final_result.is_some());
+    }
+
+    #[test]
+    fn test_react_loop_tool_then_finish() {
+        let mock_llm = MockLlmProvider::new(vec![
+            r#"{"thought": "Let me search", "action": "echo", "action_input": {"query": "test"}}"#.to_string(),
+            r#"{"thought": "Got it", "action": "finish", "result": "found the answer"}"#.to_string(),
+        ]);
+
+        let config = AgentConfig {
+            max_steps: 5,
+            ..Default::default()
+        };
+
+        let agent = ReActAgent::new(
+            Box::new(mock_llm),
+            Box::new(EchoExecutor),
+            config,
+        );
+
+        let trace = agent.run("Find something").expect("should succeed");
+        assert!(trace.success);
+        assert_eq!(trace.total_steps, 2);
+        assert_eq!(trace.entries.len(), 2);
+
+        // First entry should be a tool call.
+        match &trace.entries[0].action {
+            crate::types::TraceAction::CallTool { name, .. } => {
+                assert_eq!(name, "echo");
+            }
+            other => panic!("expected CallTool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_react_max_steps_exceeded() {
+        // LLM always wants to call a tool, never finishes.
+        let mock_llm = MockLlmProvider::new(vec![
+            r#"{"thought": "search", "action": "echo", "action_input": {}}"#.to_string(),
+            r#"{"thought": "search more", "action": "echo", "action_input": {}}"#.to_string(),
+            r#"{"thought": "search again", "action": "echo", "action_input": {}}"#.to_string(),
+            r#"{"thought": "still searching", "action": "echo", "action_input": {}}"#.to_string(),
+        ]);
+
+        let config = AgentConfig {
+            max_steps: 2,
+            ..Default::default()
+        };
+
+        let agent = ReActAgent::new(
+            Box::new(mock_llm),
+            Box::new(EchoExecutor),
+            config,
+        );
+
+        let result = agent.run("Infinite task");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AgentError::MaxStepsExceeded(n) => assert_eq!(n, 2),
+            other => panic!("expected MaxStepsExceeded, got: {:?}", other),
+        }
+    }
+
+    // ===================================================================
+    // PlanAndExecute tests with mocks
+    // ===================================================================
+
+    #[test]
+    fn test_plan_and_execute_basic() {
+        // Planner returns a 2-step plan.
+        let planner_llm = MockLlmProvider::new(vec![
+            r#"["Step 1: gather data", "Step 2: summarize"]"#.to_string(),
+        ]);
+
+        // Executor LLM finishes immediately for each sub-step.
+        let executor_llm = MockLlmProvider::new(vec![
+            r#"{"thought": "done", "action": "finish", "result": "gathered"}"#.to_string(),
+        ]);
+
+        let config = AgentConfig {
+            max_steps: 10,
+            ..Default::default()
+        };
+
+        let react = ReActAgent::new(
+            Box::new(executor_llm),
+            Box::new(EchoExecutor),
+            config,
+        );
+
+        let agent = PlanAndExecuteAgent::new(Box::new(planner_llm), react);
+
+        let trace = agent.run("Analyze the data").expect("should succeed");
+        assert!(trace.success);
+        assert_eq!(trace.plan.steps.len(), 2);
     }
 }
